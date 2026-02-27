@@ -3,6 +3,7 @@ Procesador de Video Ultra-Mejorado
 Con análisis de calidad en tiempo real y optimizaciones avanzadas
 """
 
+import gc
 import cv2
 import numpy as np
 import os
@@ -62,13 +63,16 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         logger.info(f"Sample rate: 1 de cada {sample_rate} frames")
 
     positions = []
-    quality_metrics = []
+    # Acumuladores en línea — evitan guardar una lista de dicts por frame
+    _conf_sum = 0.0
+    _stab_sum = 0.0
+    _reliable_count = 0
+    _quality_sample_count = 0
     frame_number = 0
     frames_processed = 0
     start_time = time.time()
 
-    tracking_loss_events = []
-    low_quality_frames = []
+    tracking_loss_count = 0
 
     if use_multipass:
         from app.stabilization_enhanced import MultiPassStabilizer
@@ -106,24 +110,18 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
 
                     positions.append((timestamp, stabilized_x))
 
+                # Acumular métricas sin guardar el dict completo
                 if quality:
-                    quality_metrics.append({
-                        'timestamp': timestamp,
-                        'confidence': quality.confidence,
-                        'stability': quality.stability,
-                        'is_reliable': quality.is_reliable
-                    })
+                    _conf_sum += quality.confidence
+                    _stab_sum += quality.stability
+                    if quality.is_reliable:
+                        _reliable_count += 1
+                    _quality_sample_count += 1
 
-                    if not quality.is_reliable:
-                        low_quality_frames.append(frame_number)
-
-                        if quality.lost_frames > 3:
-                            tracking_loss_events.append({
-                                'frame': frame_number,
-                                'timestamp': timestamp,
-                                'lost_frames': quality.lost_frames
-                            })
+                    if quality.lost_frames > 3:
+                        tracking_loss_count += 1
             else:
+                tracking_loss_count += 1
                 if len(positions) > 0:
                     last_pos = positions[-1][1]
                     if use_multipass:
@@ -133,7 +131,6 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
                             stabilized_x = stabilizer.stabilize(None)
                         else:
                             stabilized_x = last_pos
-
                         positions.append((timestamp, stabilized_x if stabilized_x else last_pos))
                 else:
                     center_x = (width - crop_width) // 2
@@ -142,27 +139,29 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
                     else:
                         positions.append((timestamp, center_x))
 
-                tracking_loss_events.append({
-                    'frame': frame_number,
-                    'timestamp': timestamp,
-                    'lost_frames': -1
-                })
-
             frames_processed += 1
 
             if verbose and frames_processed % 100 == 0:
                 progress = (frame_number / total_frames) * 100 if total_frames > 0 else 0
                 elapsed = time.time() - start_time
                 fps_analysis = frames_processed / elapsed if elapsed > 0 else 0
-
                 logger.info(
                     f"Progreso: {progress:.1f}% "
                     f"({frames_processed} frames, {fps_analysis:.1f} fps)"
                 )
 
+        # Liberar referencia al frame explícitamente para que el GC
+        # recupere memoria antes del siguiente cap.read()
+        del frame
+
+        # Ayudar al GC cada 500 frames para prevenir picos prolongados
+        if frame_number % 500 == 0:
+            gc.collect()
+
         frame_number += 1
 
     cap.release()
+    gc.collect()
 
     if use_multipass and positions:
         if verbose:
@@ -176,19 +175,18 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         logger.info(f"Frames procesados: {frames_processed}")
         logger.info(f"Keyframes generados: {len(positions)}")
 
-        if quality_metrics:
-            avg_confidence = np.mean([m['confidence'] for m in quality_metrics])
-            avg_stability = np.mean([m['stability'] for m in quality_metrics])
-            reliable_frames = sum(1 for m in quality_metrics if m['is_reliable'])
-            reliability_rate = (reliable_frames / len(quality_metrics)) * 100
+        if _quality_sample_count > 0:
+            avg_confidence = _conf_sum / _quality_sample_count
+            avg_stability = _stab_sum / _quality_sample_count
+            reliability_rate = _reliable_count / _quality_sample_count
 
             logger.info("Métricas de Tracking:")
             logger.info(f"Confianza promedio: {avg_confidence * 100:.1f}%")
             logger.info(f"Estabilidad promedio: {avg_stability * 100:.1f}%")
-            logger.info(f"Frames confiables: {reliability_rate:.1f}%")
+            logger.info(f"Frames confiables: {reliability_rate * 100:.1f}%")
 
-            if tracking_loss_events:
-                logger.warning(f"Eventos de pérdida de tracking: {len(tracking_loss_events)}")
+        if tracking_loss_count:
+            logger.warning(f"Eventos de pérdida de tracking: {tracking_loss_count}")
 
         stats = detector.get_tracking_stats()
         logger.info("Estadísticas del Detector:")
@@ -227,17 +225,15 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         'keyframes': len(positions),
         'analysis_time': analysis_time,
         'total_time': total_time,
-        'tracking_loss_events': len(tracking_loss_events),
-        'quality_metrics': quality_metrics,
+        'tracking_loss_events': tracking_loss_count,
         'overall_quality': 1.0,
         'reliability_rate': 0.0,
     }
 
-    if quality_metrics:
-        avg_confidence = np.mean([m['confidence'] for m in quality_metrics])
-        avg_stability = np.mean([m['stability'] for m in quality_metrics])
-        reliable_frames = sum(1 for m in quality_metrics if m['is_reliable'])
-        reliability_rate = (reliable_frames / len(quality_metrics))
+    if _quality_sample_count > 0:
+        avg_confidence = _conf_sum / _quality_sample_count
+        avg_stability = _stab_sum / _quality_sample_count
+        reliability_rate = _reliable_count / _quality_sample_count
 
         metrics['overall_quality'] = (
             avg_confidence * 0.4 +

@@ -200,11 +200,11 @@ def build_advanced_lerp_expression(positions, use_easing):
 
 def execute_ffmpeg(cmd, output_path):
     try:
+        # No capturar stdout/stderr en memoria — FFmpeg escribe mucho en stderr
+        # y bufferearlo puede provocar picos de RAM. Los logs van directo al proceso.
         subprocess.run(
             cmd,
-            check=True,
-            capture_output=True,
-            text=True
+            check=True
         )
 
         logger.info("Video generado exitosamente")
@@ -217,8 +217,7 @@ def execute_ffmpeg(cmd, output_path):
         return True
 
     except subprocess.CalledProcessError as e:
-        logger.error("Error en FFmpeg")
-        logger.error("STDERR: %s", e.stderr[-1000:])
+        logger.error("Error en FFmpeg (código de salida: %d)", e.returncode)
         return False
 
 
@@ -233,6 +232,7 @@ def print_video_info(video_path):
     ]
 
     try:
+        # ffprobe solo emite JSON pequeño — capture_output aquí es seguro
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         info = json.loads(result.stdout)
 

@@ -96,7 +96,7 @@ ENCODING_SETTINGS_ENHANCED = {
     'color_primaries': 'bt709',
     'color_trc': 'bt709',
     'colorspace': 'bt709',
-    'quality_preset': 'high',
+    'quality_preset': 'balanced',
     'presets': {
         'ultra_fast': {
             'preset': 'ultrafast',
@@ -212,18 +212,18 @@ def apply_preset_enhanced(preset_name):
         ENCODING_SETTINGS_ENHANCED['apply_unsharp'] = False
 
     elif preset_name == 'tiktok':
-        apply_preset_enhanced('professional')
+        apply_preset_enhanced('balanced')
         CROP_SETTINGS_ENHANCED['headroom_ratio'] = 0.16
         ENCODING_SETTINGS_ENHANCED['quality_preset'] = 'web'
 
     elif preset_name == 'instagram':
-        apply_preset_enhanced('professional')
+        apply_preset_enhanced('balanced')
         CROP_SETTINGS_ENHANCED['headroom_ratio'] = 0.18
-        ENCODING_SETTINGS_ENHANCED['quality_preset'] = 'high'
+        ENCODING_SETTINGS_ENHANCED['quality_preset'] = 'balanced'
 
     elif preset_name == 'youtube_shorts':
-        apply_preset_enhanced('ultra_quality')
-        ENCODING_SETTINGS_ENHANCED['quality_preset'] = 'high'
+        apply_preset_enhanced('professional')
+        ENCODING_SETTINGS_ENHANCED['quality_preset'] = 'balanced'
 
     logger.info(
         "Preset aplicado: %s | Encoding: %s | Sample rate: 1/%s | Multi-paso: %s",

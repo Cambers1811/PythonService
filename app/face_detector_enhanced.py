@@ -3,12 +3,18 @@ Sistema de Detección de Rostros Ultra-Mejorado
 Con detección híbrida, recuperación ante pérdidas y análisis de confianza
 """
 
+import gc
 import cv2
 import mediapipe as mp
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+
+# Resolución máxima para detección facial.
+# Los frames se reducen a este ancho ANTES de pasarlos a MediaPipe/fallback,
+# eliminando el pico de ~24 MB por frame 4K que causa el OOM killer.
+DETECTION_MAX_WIDTH = 960
 
 
 @dataclass
@@ -209,8 +215,9 @@ class EnhancedFaceDetector:
         self.config = config
 
         # MediaPipe Face Detection - detector principal
+        # model_complexity=0 y max_num_faces=1 reducen memoria interna del modelo.
         self.mp_face = mp.solutions.face_detection.FaceDetection(
-            model_selection=config.FACE_DETECTION['model_selection'],
+            model_selection=0,                                         # 0 = modelo ligero
             min_detection_confidence=config.FACE_DETECTION['min_confidence']
         )
 
@@ -280,10 +287,32 @@ class EnhancedFaceDetector:
         return faces
 
     def _detect_mediapipe(self, frame) -> List[dict]:
-        """Detección principal con MediaPipe"""
+        """Detección principal con MediaPipe.
+
+        El frame se reduce a DETECTION_MAX_WIDTH antes de procesarlo para
+        evitar el pico de ~24 MB por frame 4K. Las bounding boxes se
+        reescalan al tamaño original antes de devolverlas.
+        """
         h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # --- Downscale para detección ---
+        if w > DETECTION_MAX_WIDTH:
+            scale = DETECTION_MAX_WIDTH / w
+            det_w = DETECTION_MAX_WIDTH
+            det_h = int(h * scale)
+            small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
+        else:
+            scale = 1.0
+            det_w, det_h = w, h
+            small = frame  # sin copia extra
+
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         result = self.mp_face.process(rgb)
+
+        # Liberar explícitamente para ayudar al GC
+        del rgb
+        if w > DETECTION_MAX_WIDTH:
+            del small
 
         faces = []
         if result.detections:
@@ -294,10 +323,11 @@ class EnhancedFaceDetector:
                     continue
 
                 bbox = det.location_data.relative_bounding_box
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                bw = int(bbox.width * w)
-                bh = int(bbox.height * h)
+                # Coordenadas en espacio del frame reducido, luego escalar a original
+                x = int(bbox.xmin * det_w / scale)
+                y = int(bbox.ymin * det_h / scale)
+                bw = int(bbox.width * det_w / scale)
+                bh = int(bbox.height * det_h / scale)
 
                 if not self._is_valid_detection(x, y, bw, bh, w, h):
                     continue
@@ -314,16 +344,37 @@ class EnhancedFaceDetector:
 
     def _detect_with_fallback(self, frame) -> List[dict]:
         """
-        Detección fallback usando región de piel + posición predicha de trackers
+        Detección fallback usando región de piel + posición predicha de trackers.
+        El frame se reduce a DETECTION_MAX_WIDTH para mantener consistencia
+        con _detect_mediapipe y evitar picos de memoria.
         """
         self.fallback_activations += 1
         h, w, _ = frame.shape
-        
-        # Obtener regiones de piel
-        skin_regions = self.skin_detector.detect_face_regions(frame)
-        
-        if not skin_regions:
+
+        # Downscale para fallback
+        if w > DETECTION_MAX_WIDTH:
+            scale = DETECTION_MAX_WIDTH / w
+            det_w = DETECTION_MAX_WIDTH
+            det_h = int(h * scale)
+            small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
+        else:
+            scale = 1.0
+            small = frame
+
+        # Obtener regiones de piel en resolución reducida
+        skin_regions_small = self.skin_detector.detect_face_regions(small)
+
+        if w > DETECTION_MAX_WIDTH:
+            del small
+
+        if not skin_regions_small:
             return []
+
+        # Escalar regiones de piel a resolución original
+        skin_regions = [
+            (int(x / scale), int(y / scale), int(sw / scale), int(sh / scale))
+            for x, y, sw, sh in skin_regions_small
+        ]
         
         # Correlacionar con posiciones predichas de trackers
         faces = []
