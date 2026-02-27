@@ -1,0 +1,19 @@
+# FastAPI y servidor
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# Cloudinary
+cloudinary==1.38.0
+
+# Requests para descargar archivos
+requests==2.31.0
+
+# Video processing (tus scripts)
+opencv-python==4.9.0.80
+numpy==1.26.3
+mediapipe==0.10.9   #Hay version mas nueva, luego actualizar y con ello el archivo config.enchance
+
+# Opcional pero recomendado
+python-multipart==0.0.6  # Para subir archivos si lo necesitas
+python-dotenv==1.0.0     # Para manejar variables de entorno
