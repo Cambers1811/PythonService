@@ -17,3 +17,6 @@ mediapipe==0.10.9   #Hay version mas nueva, luego actualizar y con ello el archi
 # Opcional pero recomendado
 python-multipart==0.0.6  # Para subir archivos si lo necesitas
 python-dotenv==1.0.0     # Para manejar variables de entorno
+
+# JWT para verificar los tokens
+PyJWT==2.8.0
