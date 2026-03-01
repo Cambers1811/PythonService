@@ -3,7 +3,6 @@ Procesador de Video Ultra-Mejorado
 Con análisis de calidad en tiempo real y optimizaciones avanzadas
 """
 
-import gc
 import cv2
 import numpy as np
 import os
@@ -49,9 +48,76 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         logger.info(f"Resolución: {width}x{height}")
         logger.info(f"Duración: {duration:.2f}s ({total_frames} frames @ {fps:.2f} fps)")
 
+    # ============================================================
+    # VALIDACIÓN: Detectar si el video ya es vertical
+    # ============================================================
+    aspect_ratio = width / height
+    target_aspect = 9 / 16  # 0.5625
+
+    # Si el video ya es vertical (tolerancia de ±5%)
+    if 0.53 <= aspect_ratio <= 0.59:  # Rango 9:16 ± 5%
+        logger.info(
+            "Video ya es vertical | %dx%d | ratio=%.3f | target=%.3f",
+            width, height, aspect_ratio, target_aspect
+        )
+
+        # Si las dimensiones coinciden exactamente con el target, devolver video original
+        crop_width = config.CROP_SETTINGS['width']
+        crop_height = config.CROP_SETTINGS['height']
+
+        if width == crop_width and height == crop_height:
+            logger.info(
+                "Dimensiones exactas (%dx%d). Retornando video original sin procesamiento.",
+                width, height
+            )
+            cap.release()
+
+            # Retornar el video original con métricas básicas
+            metrics = {
+                'total_frames': total_frames,
+                'frames_processed': 0,
+                'keyframes': 0,
+                'analysis_time': 0,
+                'total_time': 0,
+                'overall_quality': 1.0,
+                'skipped_reason': 'already_vertical_exact_dimensions'
+            }
+
+            return input_path, metrics
+
+        # Si es vertical pero dimensiones diferentes, hacer re-encode simple sin crop
+        logger.info(
+            "Video vertical pero dimensiones diferentes (%dx%d vs %dx%d). Re-encoding sin crop.",
+            width, height, crop_width, crop_height
+        )
+        cap.release()
+
+        return process_already_vertical_video(input_path, config, encoder)
+
+    # Si el video NO es vertical pero la resolución de salida es igual o mayor
+    # que la de entrada, no se puede hacer crop
+    crop_width = config.CROP_SETTINGS['width']
+    crop_height = config.CROP_SETTINGS['height']
+
+    if width <= crop_width:
+        logger.warning(
+            "Video más estrecho que el crop deseado | input=%dx%d | crop=%dx%d",
+            width, height, crop_width, crop_height
+        )
+        logger.info("Procesando en modo 'full' (letterbox) en lugar de crop")
+        cap.release()
+        return process_full_mode_simple(input_path, config, encoder=encoder)
+
+    # Video es horizontal, continuar con procesamiento normal
+    logger.info(
+        "Video horizontal detectado | %dx%d | ratio=%.3f | Aplicando smart crop",
+        width, height, aspect_ratio
+    )
+
     mode = config.CONVERSION_MODE['mode']
 
     if mode == 'full':
+        cap.release()
         return process_full_mode_simple(input_path, config, encoder=encoder)
 
     crop_width = config.CROP_SETTINGS['width']
@@ -63,16 +129,13 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         logger.info(f"Sample rate: 1 de cada {sample_rate} frames")
 
     positions = []
-    # Acumuladores en línea — evitan guardar una lista de dicts por frame
-    _conf_sum = 0.0
-    _stab_sum = 0.0
-    _reliable_count = 0
-    _quality_sample_count = 0
+    quality_metrics = []
     frame_number = 0
     frames_processed = 0
     start_time = time.time()
 
-    tracking_loss_count = 0
+    tracking_loss_events = []
+    low_quality_frames = []
 
     if use_multipass:
         from app.stabilization_enhanced import MultiPassStabilizer
@@ -110,18 +173,24 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
 
                     positions.append((timestamp, stabilized_x))
 
-                # Acumular métricas sin guardar el dict completo
                 if quality:
-                    _conf_sum += quality.confidence
-                    _stab_sum += quality.stability
-                    if quality.is_reliable:
-                        _reliable_count += 1
-                    _quality_sample_count += 1
+                    quality_metrics.append({
+                        'timestamp': timestamp,
+                        'confidence': quality.confidence,
+                        'stability': quality.stability,
+                        'is_reliable': quality.is_reliable
+                    })
 
-                    if quality.lost_frames > 3:
-                        tracking_loss_count += 1
+                    if not quality.is_reliable:
+                        low_quality_frames.append(frame_number)
+
+                        if quality.lost_frames > 3:
+                            tracking_loss_events.append({
+                                'frame': frame_number,
+                                'timestamp': timestamp,
+                                'lost_frames': quality.lost_frames
+                            })
             else:
-                tracking_loss_count += 1
                 if len(positions) > 0:
                     last_pos = positions[-1][1]
                     if use_multipass:
@@ -131,6 +200,7 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
                             stabilized_x = stabilizer.stabilize(None)
                         else:
                             stabilized_x = last_pos
+
                         positions.append((timestamp, stabilized_x if stabilized_x else last_pos))
                 else:
                     center_x = (width - crop_width) // 2
@@ -139,29 +209,27 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
                     else:
                         positions.append((timestamp, center_x))
 
+                tracking_loss_events.append({
+                    'frame': frame_number,
+                    'timestamp': timestamp,
+                    'lost_frames': -1
+                })
+
             frames_processed += 1
 
             if verbose and frames_processed % 100 == 0:
                 progress = (frame_number / total_frames) * 100 if total_frames > 0 else 0
                 elapsed = time.time() - start_time
                 fps_analysis = frames_processed / elapsed if elapsed > 0 else 0
+
                 logger.info(
                     f"Progreso: {progress:.1f}% "
                     f"({frames_processed} frames, {fps_analysis:.1f} fps)"
                 )
 
-        # Liberar referencia al frame explícitamente para que el GC
-        # recupere memoria antes del siguiente cap.read()
-        del frame
-
-        # Ayudar al GC cada 500 frames para prevenir picos prolongados
-        if frame_number % 500 == 0:
-            gc.collect()
-
         frame_number += 1
 
     cap.release()
-    gc.collect()
 
     if use_multipass and positions:
         if verbose:
@@ -175,18 +243,19 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         logger.info(f"Frames procesados: {frames_processed}")
         logger.info(f"Keyframes generados: {len(positions)}")
 
-        if _quality_sample_count > 0:
-            avg_confidence = _conf_sum / _quality_sample_count
-            avg_stability = _stab_sum / _quality_sample_count
-            reliability_rate = _reliable_count / _quality_sample_count
+        if quality_metrics:
+            avg_confidence = np.mean([m['confidence'] for m in quality_metrics])
+            avg_stability = np.mean([m['stability'] for m in quality_metrics])
+            reliable_frames = sum(1 for m in quality_metrics if m['is_reliable'])
+            reliability_rate = (reliable_frames / len(quality_metrics)) * 100
 
             logger.info("Métricas de Tracking:")
             logger.info(f"Confianza promedio: {avg_confidence * 100:.1f}%")
             logger.info(f"Estabilidad promedio: {avg_stability * 100:.1f}%")
-            logger.info(f"Frames confiables: {reliability_rate * 100:.1f}%")
+            logger.info(f"Frames confiables: {reliability_rate:.1f}%")
 
-        if tracking_loss_count:
-            logger.warning(f"Eventos de pérdida de tracking: {tracking_loss_count}")
+            if tracking_loss_events:
+                logger.warning(f"Eventos de pérdida de tracking: {len(tracking_loss_events)}")
 
         stats = detector.get_tracking_stats()
         logger.info("Estadísticas del Detector:")
@@ -225,15 +294,17 @@ def process_video_enhanced(input_path, config, detector, stabilizer, use_multipa
         'keyframes': len(positions),
         'analysis_time': analysis_time,
         'total_time': total_time,
-        'tracking_loss_events': tracking_loss_count,
+        'tracking_loss_events': len(tracking_loss_events),
+        'quality_metrics': quality_metrics,
         'overall_quality': 1.0,
         'reliability_rate': 0.0,
     }
 
-    if _quality_sample_count > 0:
-        avg_confidence = _conf_sum / _quality_sample_count
-        avg_stability = _stab_sum / _quality_sample_count
-        reliability_rate = _reliable_count / _quality_sample_count
+    if quality_metrics:
+        avg_confidence = np.mean([m['confidence'] for m in quality_metrics])
+        avg_stability = np.mean([m['stability'] for m in quality_metrics])
+        reliable_frames = sum(1 for m in quality_metrics if m['is_reliable'])
+        reliability_rate = (reliable_frames / len(quality_metrics))
 
         metrics['overall_quality'] = (
             avg_confidence * 0.4 +
@@ -282,6 +353,97 @@ def process_full_mode_simple(input_path, config, encoder='libx264'):
     }
 
     return output_path, metrics
+
+
+def process_already_vertical_video(input_path, config, encoder='libx264'):
+    """
+    Procesa un video que ya es vertical (9:16) pero con dimensiones diferentes
+    a las del target. Hace un re-scale sin crop.
+
+    Args:
+        input_path: Path del video de entrada
+        config: Configuración del sistema
+        encoder: Encoder a usar (libx264, h264_nvenc, etc.)
+
+    Returns:
+        (output_path, metrics): Tupla con path de salida y métricas
+    """
+    import subprocess
+
+    logger.info("Procesando video vertical con dimensiones no estándar")
+
+    input_name = Path(input_path).stem
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    temp_dir = os.path.join(project_root, 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
+
+    output_filename = f"{input_name}_vertical_rescaled_{timestamp_str}.mp4"
+    output_path = os.path.join(temp_dir, output_filename)
+
+    # Obtener dimensiones target
+    crop_width = config.CROP_SETTINGS['width']
+    crop_height = config.CROP_SETTINGS['height']
+
+    # Obtener settings de encoding
+    quality_preset = config.ENCODING_SETTINGS['quality_preset']
+    settings = config.ENCODING_SETTINGS['presets'][quality_preset]
+
+    # Construir comando FFmpeg para rescale
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vf", f"scale={crop_width}:{crop_height}:force_original_aspect_ratio=decrease,"
+               f"pad={crop_width}:{crop_height}:(ow-iw)/2:(oh-ih)/2:color=black",
+        "-c:v", encoder,
+        "-preset", settings["preset"],
+        "-crf", str(settings["crf"]),
+    ]
+
+    # Solo agregar profile para software encoders
+    if encoder == 'libx264':
+        cmd.extend(["-profile:v", settings.get("profile", "high")])
+
+    cmd.extend([
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ])
+
+    logger.info(f"Re-scaling video vertical a {crop_width}x{crop_height}")
+    logger.info(f"Encoder: {encoder}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        logger.info("Video re-escalado exitosamente")
+        logger.info(f"Output: {output_path}")
+
+        metrics = {
+            'total_frames': 0,
+            'frames_processed': 0,
+            'keyframes': 0,
+            'analysis_time': 0,
+            'total_time': 0,
+            'overall_quality': 1.0,
+            'mode': 'vertical_rescale'
+        }
+
+        return output_path, metrics
+
+    except subprocess.CalledProcessError as e:
+        logger.error("Error en FFmpeg durante re-scale")
+        logger.error(f"STDERR: {e.stderr[-500:]}")
+        raise RuntimeError("Error al re-escalar el video vertical")
 
 
 def calculate_optimal_composition(face, frame_size, crop_size, config):
