@@ -1,10 +1,10 @@
 """
 Progress Tracker — Sistema de tracking detallado de progreso y estados.
 
-Versión 2: Agrega fases específicas para los modos short_auto y short_manual:
-  - SELECTING_SEGMENT: Determinando qué segmento extraer
-  - CUTTING_SEGMENT:   FFmpeg extrayendo el segmento (archivo intermedio)
-  - SEGMENT_COMPLETE:  Segmento listo para procesar
+Versión 3: Agrega notificación de progreso en tiempo real vía webhook con throttling.
+  - Notifica a Spring Boot cada cambio significativo de progreso
+  - Throttling: solo notifica si cambió ≥1% o cambió fase o pasaron ≥5 segundos
+  - Evita spam de webhooks manteniendo precisión
 """
 
 import time
@@ -32,11 +32,10 @@ class ProcessingPhase(str, Enum):
     DOWNLOADING = "downloading"
     DOWNLOAD_COMPLETE = "download_complete"
 
-    # Fases de short (nuevo en v2) ─────────────────────────────
-    SELECTING_SEGMENT = "selecting_segment"     # Calculando qué segmento usar
-    CUTTING_SEGMENT = "cutting_segment"         # FFmpeg cortando el segmento
-    SEGMENT_COMPLETE = "segment_complete"       # Segmento listo
-    # ───────────────────────────────────────────────────────────
+    # Fases de short
+    SELECTING_SEGMENT = "selecting_segment"
+    CUTTING_SEGMENT = "cutting_segment"
+    SEGMENT_COMPLETE = "segment_complete"
 
     # Fase de análisis
     ANALYZING = "analyzing"
@@ -67,41 +66,23 @@ class ProcessingPhase(str, Enum):
 # ============================================================
 
 PHASE_PROGRESS_MAP = {
-    # Inicio
     ProcessingPhase.QUEUED:             0,
     ProcessingPhase.VALIDATING:         5,
-
-    # Descarga
     ProcessingPhase.DOWNLOADING:        10,
     ProcessingPhase.DOWNLOAD_COMPLETE:  20,
-
-    # Fases de short (nuevo en v2)
-    # Ocupan el hueco entre la descarga y el análisis de rostros.
-    # En modo vertical estas fases no se usan, por lo que el progreso
-    # salta directamente de DOWNLOAD_COMPLETE a ANALYZING.
     ProcessingPhase.SELECTING_SEGMENT:  22,
     ProcessingPhase.CUTTING_SEGMENT:    28,
     ProcessingPhase.SEGMENT_COMPLETE:   33,
-
-    # Análisis
     ProcessingPhase.ANALYZING:          35,
     ProcessingPhase.DETECTING_FACES:    45,
     ProcessingPhase.ANALYSIS_COMPLETE:  55,
-
-    # Procesamiento
     ProcessingPhase.PROCESSING:         58,
     ProcessingPhase.STABILIZING:        62,
     ProcessingPhase.CROPPING:           65,
-
-    # Encoding
     ProcessingPhase.ENCODING:           70,
     ProcessingPhase.ENCODING_COMPLETE:  85,
-
-    # Subida
     ProcessingPhase.UPLOADING:          88,
     ProcessingPhase.UPLOAD_COMPLETE:    95,
-
-    # Fin
     ProcessingPhase.CLEANING_UP:        98,
     ProcessingPhase.COMPLETED:          100,
     ProcessingPhase.FAILED:             0,
@@ -117,12 +98,9 @@ PHASE_MESSAGES = {
     ProcessingPhase.VALIDATING:         "Validando el video...",
     ProcessingPhase.DOWNLOADING:        "Descargando video desde Cloudinary...",
     ProcessingPhase.DOWNLOAD_COMPLETE:  "Video descargado correctamente",
-
-    # Mensajes de short (nuevo en v2)
     ProcessingPhase.SELECTING_SEGMENT:  "Seleccionando segmento del video...",
     ProcessingPhase.CUTTING_SEGMENT:    "Cortando segmento del video...",
     ProcessingPhase.SEGMENT_COMPLETE:   "Segmento listo para procesar",
-
     ProcessingPhase.ANALYZING:          "Analizando contenido del video...",
     ProcessingPhase.DETECTING_FACES:    "Detectando rostros en el video...",
     ProcessingPhase.ANALYSIS_COMPLETE:  "Análisis completado",
@@ -140,19 +118,19 @@ PHASE_MESSAGES = {
 
 
 # ============================================================
-# Progress Tracker
+# Progress Tracker con Webhook Throttling
 # ============================================================
 
 class ProgressTracker:
     """
-    Tracker de progreso con timestamps y estimación de tiempo restante.
+    Tracker de progreso con timestamps, estimación de tiempo y webhooks throttled.
     """
 
     def __init__(self, job_id: str, update_callback: Optional[Callable] = None):
         """
         Args:
             job_id:           ID del job a trackear.
-            update_callback:  Función llamada en cada actualización.
+            update_callback:  Función llamada en cada actualización significativa.
                               Firma: callback(job_id, progress_data)
         """
         self.job_id = job_id
@@ -170,6 +148,14 @@ class ProgressTracker:
         self.frames_processed: int = 0
 
         self.metadata: Dict[str, Any] = {}
+        
+        # ══════════════════════════════════════════════════════════
+        # Webhook throttling: solo notifica si hay cambios significativos
+        # ══════════════════════════════════════════════════════════
+        self._last_notified_progress: int = -1
+        self._last_notified_phase: Optional[ProcessingPhase] = None
+        self._last_notification_time: float = 0.0
+        self._min_notification_interval_seconds: float = 5.0  # Mínimo 5s entre webhooks
 
     def start(self):
         """Inicia el tracking"""
@@ -218,7 +204,8 @@ class ProgressTracker:
             final_message
         )
 
-        if self.update_callback:
+        # Notificar vía webhook si es necesario
+        if self._should_notify_webhook():
             self._trigger_callback(final_message)
 
     def update_progress(self, percentage: int, message: Optional[str] = None):
@@ -239,7 +226,8 @@ class ProgressTracker:
                 message
             )
 
-        if self.update_callback:
+        # Notificar vía webhook si es necesario
+        if self._should_notify_webhook():
             self._trigger_callback(message)
 
     def update_frames(self, frames_processed: int, total_frames: int):
@@ -292,11 +280,13 @@ class ProgressTracker:
             total_time
         )
 
+        # Forzar notificación final (ignorar throttling)
         if self.update_callback:
             self._trigger_callback(
                 PHASE_MESSAGES[
                     ProcessingPhase.COMPLETED if success else ProcessingPhase.FAILED
-                ]
+                ],
+                force=True
             )
 
     def get_status(self) -> Dict[str, Any]:
@@ -324,6 +314,86 @@ class ProgressTracker:
             'phases_completed': [p.value for p in self.phases_completed],
             'metadata': self.metadata,
         }
+
+    # ------------------------------------------------------------------
+    # Webhook throttling logic
+    # ------------------------------------------------------------------
+
+    def _should_notify_webhook(self) -> bool:
+        """
+        Determina si debe enviar notificación de webhook.
+        
+        Criterios para notificar:
+        1. Progreso cambió ≥ 1%
+        2. Fase cambió
+        3. Pasaron ≥ 5 segundos desde última notificación
+        
+        Returns:
+            True si debe notificar, False si no.
+        """
+        current_time = time.time()
+        
+        # Criterio 1: Progreso cambió ≥ 1%
+        progress_changed = abs(self.progress_percentage - self._last_notified_progress) >= 1
+        
+        # Criterio 2: Fase cambió
+        phase_changed = self.current_phase != self._last_notified_phase
+        
+        # Criterio 3: Pasaron ≥ 5 segundos
+        time_elapsed = (current_time - self._last_notification_time) >= self._min_notification_interval_seconds
+        
+        should_notify = progress_changed or phase_changed or time_elapsed
+        
+        if should_notify:
+            logger.debug(
+                "Webhook throttling check | job_id=%s | notify=True | "
+                "progress_changed=%s | phase_changed=%s | time_elapsed=%s",
+                self.job_id, progress_changed, phase_changed, time_elapsed
+            )
+        
+        return should_notify
+
+    def _trigger_callback(self, message: Optional[str] = None, force: bool = False):
+        """
+        Ejecuta el callback de actualización de forma segura.
+        
+        Args:
+            message: Mensaje opcional.
+            force: Si True, ignora throttling y notifica siempre.
+        """
+        if not self.update_callback:
+            return
+        
+        # Si force=True, omitir check de throttling
+        if not force and not self._should_notify_webhook():
+            return
+        
+        try:
+            progress_data = self.get_status()
+            if message:
+                progress_data['message'] = message
+            
+            self.update_callback(self.job_id, progress_data)
+            
+            # Actualizar estado de última notificación
+            self._last_notified_progress = self.progress_percentage
+            self._last_notified_phase = self.current_phase
+            self._last_notification_time = time.time()
+            
+            logger.debug(
+                "Webhook notificado | job_id=%s | progress=%d%% | phase=%s",
+                self.job_id,
+                self.progress_percentage,
+                self.current_phase.value if self.current_phase else None
+            )
+            
+        except Exception as e:
+            logger.error(
+                "Error ejecutando callback de progreso | job_id=%s | error=%s",
+                self.job_id,
+                str(e),
+                exc_info=True
+            )
 
     # ------------------------------------------------------------------
     # Métodos privados
@@ -360,22 +430,6 @@ class ProgressTracker:
             minutes = int((seconds % 3600) / 60)
             return f"{hours}h {minutes}m"
 
-    def _trigger_callback(self, message: Optional[str] = None):
-        """Ejecuta el callback de actualización de forma segura"""
-        if not self.update_callback:
-            return
-        try:
-            progress_data = self.get_status()
-            if message:
-                progress_data['message'] = message
-            self.update_callback(self.job_id, progress_data)
-        except Exception as e:
-            logger.error(
-                "Error ejecutando callback de progreso | job_id=%s | error=%s",
-                self.job_id,
-                str(e)
-            )
-
 
 # ============================================================
 # Factory function
@@ -390,7 +444,7 @@ def create_progress_tracker(
 
     Args:
         job_id:           ID del job.
-        update_callback:  Callback opcional para actualizaciones.
+        update_callback:  Callback opcional para actualizaciones de webhook.
 
     Returns:
         ProgressTracker ya iniciado.

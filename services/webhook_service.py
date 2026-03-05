@@ -1,32 +1,29 @@
 """
-Webhook Service — Notifica a Spring Boot cuando un job termina.
+Webhook Service — Notifica a Spring Boot sobre el estado de los jobs.
 
-Responsabilidad única: hacer el POST al webhook de Spring Boot
-con el resultado del job (exitoso, fallido o cancelado).
+Versión 2: Agrega notificación de progreso en tiempo real.
 
-Por qué está separado de video_service.py:
-  - video_service procesa videos, no gestiona notificaciones.
-  - Si el webhook falla, el job ya terminó correctamente —
-    el error es de notificación, no de procesamiento.
-  - Facilita testear el procesamiento sin depender de Spring Boot.
+Responsabilidades:
+  - Notificar cuando un job completa/falla/cancela (existente)
+  - Notificar progreso en tiempo real durante el procesamiento (nuevo)
 
 Configuración requerida (variables de entorno):
-  SPRING_BOOT_WEBHOOK_URL  — URL completa del endpoint de Spring Boot
-                             Ejemplo: https://elevideo.onrender.com/api/internal/processing-jobs/webhook
-  SERVICE_API_KEY          — mismo valor que en Spring Boot para X-Service-Key
+  SPRING_BOOT_WEBHOOK_URL  — URL para notificaciones finales
+                              Ejemplo: https://api.com/api/internal/processing-jobs/webhook
+  SPRING_BOOT_PROGRESS_WEBHOOK_URL — URL para notificaciones de progreso
+                              Ejemplo: https://api.com/api/webhook/progress
+  SERVICE_API_KEY          — API key compartido con Spring Boot
 
 Comportamiento ante fallos:
-  - Reintenta 3 veces con backoff exponencial (1s, 2s, 4s).
-  - Si los 3 intentos fallan, loguea el error pero NO lanza excepción.
-  - El job queda marcado correctamente en jobs_db de Python —
-    Spring Boot puede recuperar el estado haciendo polling manual si lo necesita.
+  - Notificaciones finales: Reintenta 3 veces con backoff.
+  - Notificaciones de progreso: 1 solo intento (no crítico).
 """
 
 import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import requests
 from dotenv import load_dotenv
@@ -40,17 +37,27 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------
 
 WEBHOOK_URL: str = os.getenv("SPRING_BOOT_WEBHOOK_URL", "")
+PROGRESS_WEBHOOK_URL: str = os.getenv("SPRING_BOOT_PROGRESS_WEBHOOK_URL", "")
 SERVICE_API_KEY: str = os.getenv("SERVICE_API_KEY", "")
 
-# Reintentos con backoff exponencial
+# Reintentos con backoff exponencial (solo para webhooks finales)
 MAX_RETRIES: int = 3
-RETRY_BASE_DELAY: float = 1.0  # segundos — se duplica en cada reintento
-WEBHOOK_TIMEOUT: int = 10       # segundos máximo por request
+RETRY_BASE_DELAY: float = 1.0
+WEBHOOK_TIMEOUT: int = 10
+
+# Timeout para webhooks de progreso (no se reintenta)
+PROGRESS_WEBHOOK_TIMEOUT: int = 3  # 3 segundos
 
 if not WEBHOOK_URL:
     logger.warning(
         "SPRING_BOOT_WEBHOOK_URL no configurada. "
         "Las notificaciones de jobs completados están DESACTIVADAS."
+    )
+
+if not PROGRESS_WEBHOOK_URL:
+    logger.warning(
+        "SPRING_BOOT_PROGRESS_WEBHOOK_URL no configurada. "
+        "Las notificaciones de progreso en tiempo real están DESACTIVADAS."
     )
 
 if not SERVICE_API_KEY:
@@ -61,7 +68,7 @@ if not SERVICE_API_KEY:
 
 
 # -------------------------------------------------------------------
-# Función principal
+# Webhooks de notificación FINAL (completado/fallido/cancelado)
 # -------------------------------------------------------------------
 
 def notify_job_completed(
@@ -87,7 +94,7 @@ def notify_job_completed(
         return False
 
     payload = _build_completed_payload(job_id, output_url, metrics, job_data)
-    return _send_with_retry(job_id, payload)
+    return _send_with_retry(job_id, payload, WEBHOOK_URL)
 
 
 def notify_job_failed(
@@ -111,7 +118,7 @@ def notify_job_failed(
         return False
 
     payload = _build_failed_payload(job_id, error_message, job_data)
-    return _send_with_retry(job_id, payload)
+    return _send_with_retry(job_id, payload, WEBHOOK_URL)
 
 
 def notify_job_cancelled(job_id: str, job_data: dict) -> bool:
@@ -122,7 +129,32 @@ def notify_job_cancelled(job_id: str, job_data: dict) -> bool:
         return False
 
     payload = _build_cancelled_payload(job_id, job_data)
-    return _send_with_retry(job_id, payload)
+    return _send_with_retry(job_id, payload, WEBHOOK_URL)
+
+
+# -------------------------------------------------------------------
+# Webhook de PROGRESO en tiempo real (nuevo)
+# -------------------------------------------------------------------
+
+def notify_progress(job_id: str, progress_data: Dict[str, Any]) -> bool:
+    """
+    Notifica a Spring Boot sobre el progreso actual del job.
+    
+    Este webhook NO se reintenta — es best-effort.
+    Si falla, el progreso simplemente no se actualiza en esa iteración.
+    
+    Args:
+        job_id:        ID del job.
+        progress_data: Diccionario con progreso actual del ProgressTracker.
+        
+    Returns:
+        True si se notificó exitosamente, False si falló.
+    """
+    if not PROGRESS_WEBHOOK_URL:
+        return False
+    
+    payload = _build_progress_payload(job_id, progress_data)
+    return _send_progress_webhook(job_id, payload)
 
 
 # -------------------------------------------------------------------
@@ -210,11 +242,35 @@ def _build_cancelled_payload(job_id: str, job_data: dict) -> dict:
     }
 
 
+def _build_progress_payload(job_id: str, progress_data: Dict[str, Any]) -> dict:
+    """
+    Construye el payload para notificación de progreso.
+    
+    Campos enviados a Spring Boot:
+      - job_id
+      - status (siempre "processing")
+      - progress (0-100)
+      - phase (string)
+      - eta_seconds
+      - elapsed_seconds
+      - message
+    """
+    return {
+        "job_id":           job_id,
+        "status":           "processing",  # Siempre "processing" para webhooks de progreso
+        "progress":         progress_data.get("progress", 0),
+        "phase":            progress_data.get("phase"),
+        "eta_seconds":      progress_data.get("eta_seconds"),
+        "elapsed_seconds":  progress_data.get("elapsed_seconds"),
+        "message":          progress_data.get("message", "Procesando..."),
+    }
+
+
 # -------------------------------------------------------------------
-# HTTP con reintentos
+# HTTP con reintentos (solo para webhooks finales)
 # -------------------------------------------------------------------
 
-def _send_with_retry(job_id: str, payload: dict) -> bool:
+def _send_with_retry(job_id: str, payload: dict, webhook_url: str) -> bool:
     """
     Envía el webhook con reintentos y backoff exponencial.
 
@@ -231,7 +287,7 @@ def _send_with_retry(job_id: str, payload: dict) -> bool:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.post(
-                WEBHOOK_URL,
+                webhook_url,
                 json=payload,
                 headers=headers,
                 timeout=WEBHOOK_TIMEOUT,
@@ -287,3 +343,64 @@ def _send_with_retry(job_id: str, payload: dict) -> bool:
         MAX_RETRIES, job_id,
     )
     return False
+
+
+# -------------------------------------------------------------------
+# HTTP sin reintentos (solo para webhooks de progreso)
+# -------------------------------------------------------------------
+
+def _send_progress_webhook(job_id: str, payload: dict) -> bool:
+    """
+    Envía webhook de progreso sin reintentos (best-effort).
+    
+    Si falla, solo loguea warning — no es crítico.
+    El progreso se puede recuperar en la siguiente actualización.
+    """
+    headers = {
+        "Content-Type":  "application/json",
+        "X-Service-Key": SERVICE_API_KEY,
+    }
+
+    try:
+        response = requests.post(
+            PROGRESS_WEBHOOK_URL,
+            json=payload,
+            headers=headers,
+            timeout=PROGRESS_WEBHOOK_TIMEOUT,
+        )
+
+        if response.status_code in (200, 201, 204):
+            logger.debug(
+                "Webhook de progreso enviado | job_id=%s | progress=%d%% | phase=%s",
+                job_id,
+                payload.get("progress", 0),
+                payload.get("phase")
+            )
+            return True
+        else:
+            logger.warning(
+                "Webhook de progreso rechazado | job_id=%s | status=%d",
+                job_id,
+                response.status_code
+            )
+            return False
+
+    except requests.Timeout:
+        logger.warning(
+            "Webhook de progreso timeout | job_id=%s",
+            job_id
+        )
+        return False
+    except requests.ConnectionError:
+        logger.warning(
+            "Webhook de progreso connection error | job_id=%s",
+            job_id
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "Webhook de progreso error | job_id=%s | error=%s",
+            job_id,
+            str(e)
+        )
+        return False

@@ -55,7 +55,7 @@ from optimization import (
     get_performance_monitor,
     HardwareAccelerationDetector,
 )
-
+from services.webhook_service import notify_progress
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +81,43 @@ class VideoProcessingService:
         """Establece el callback de progreso para el router"""
         self.progress_callback = callback
 
+    def _create_progress_webhook_callback(self, job_id: str) -> Callable:
+        """
+        Crea un callback que envía webhooks de progreso a Spring Boot.
+
+        Este callback se ejecuta cada vez que hay un cambio significativo:
+        - Progreso cambió ≥ 1%
+        - Fase cambió
+        - Pasaron ≥ 5 segundos desde última notificación
+
+        Args:
+            job_id: ID del job
+
+        Returns:
+            Función callback que acepta (job_id, progress_data)
+        """
+
+        def progress_callback(job_id_inner: str, progress_data: dict):
+            """
+            Callback ejecutado en cada cambio significativo de progreso.
+
+            Args:
+                job_id_inner: ID del job
+                progress_data: Diccionario con datos de progreso del ProgressTracker
+            """
+            # Enviar webhook a Spring Boot
+            notify_progress(job_id_inner, progress_data)
+
+        return progress_callback
+
     # ============================================================
     # Punto de entrada principal
     # ============================================================
 
     def process_video(
-        self,
-        request: VideoProcessRequest,
-        job_id: str
+            self,
+            request: VideoProcessRequest,
+            job_id: str
     ) -> Tuple[str, dict]:
         """
         Orquesta el flujo completo de procesamiento.
@@ -118,8 +147,11 @@ class VideoProcessingService:
 
         perf = self.performance_monitor
 
-        # Inicializar progress tracker
-        base_tracker = ProgressTracker(job_id, update_callback=self.progress_callback)
+        # Crear callback de webhook de progreso
+        webhook_callback = self._create_progress_webhook_callback(job_id)
+
+        # Inicializar progress tracker CON el callback de webhooks
+        base_tracker = ProgressTracker(job_id, update_callback=webhook_callback)
         base_tracker.start()
 
         tracker = CancellableProgressTracker(
@@ -219,6 +251,23 @@ class VideoProcessingService:
 
             tracker.update_phase(ProcessingPhase.ENCODING_COMPLETE)
 
+            # ── VERIFICACIÓN CRÍTICA: Cancelación después de procesar ─────
+            # Si el job fue cancelado DESPUÉS de completar el procesamiento
+            # pero ANTES de subir a Cloudinary, debemos detener aquí para:
+            # 1. No desperdiciar ancho de banda subiendo
+            # 2. No generar costos de almacenamiento innecesarios
+            # 3. No generar thumbnails/previews de un job cancelado
+            if self.cancellation_manager.is_cancelled(job_id):
+                logger.warning(
+                    "Job cancelado después de completar procesamiento | job_id=%s | "
+                    "output_local=%s (no subido a Cloudinary)",
+                    job_id,
+                    local_output_path
+                )
+                # Cleanup del archivo procesado localmente
+                cleanup()
+                raise JobCancelledException(job_id)
+
             # ── PASO 5: Subida ────────────────────────────────────────
             tracker.update_phase(ProcessingPhase.UPLOADING)
 
@@ -309,11 +358,11 @@ class VideoProcessingService:
     # ============================================================
 
     def _generate_and_upload_previews(
-        self,
-        local_output_path: str,
-        job_id: str,
-        platform: str,
-        processing_mode: ProcessingMode
+            self,
+            local_output_path: str,
+            job_id: str,
+            platform: str,
+            processing_mode: ProcessingMode
     ) -> Tuple[Optional[str], Optional[str]]:
         """
         Genera y sube thumbnail y preview clip.
